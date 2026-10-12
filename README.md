@@ -143,8 +143,3 @@ The meeting must contain audible speech and the capture dialog must share system
 ### Live insights panel stays empty
 
 This calls the same Groq chat model as the final report, just more often and on a smaller window of text. If it's empty, check the browser console/network tab for `/api/meetings/{id}/analyze` errors — the most likely cause is the same as any other Groq call failing (bad key, rate limit).
-
-## Security
-
-Keep `.env` private. API keys are used only by the backend and are not sent to the browser UI.
-
