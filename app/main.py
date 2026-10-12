@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 import sqlite3, os, json, time, subprocess, shutil, re, html, difflib
 import requests
-from .report_render import (build_mind_map, clock, render_docx, render_html, question_rows)
+from .report_render import (build_mind_map, clean_action, clean_decision, clean_question, clock, merge_items, mind_view, nice_dt, render_docx, render_html)
 
 BASE=Path(__file__).resolve().parents[1]
 try:
@@ -34,6 +34,8 @@ def db():
     CREATE TABLE IF NOT EXISTS screenshots(id INTEGER PRIMARY KEY AUTOINCREMENT,meeting_id INTEGER NOT NULL,path TEXT NOT NULL,timestamp REAL NOT NULL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT,meeting_id INTEGER NOT NULL,type TEXT NOT NULL,content TEXT NOT NULL,assignee TEXT,deadline TEXT,timestamp REAL NOT NULL,confidence REAL NOT NULL,status TEXT NOT NULL,evidence TEXT DEFAULT '');
     CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT,meeting_id INTEGER UNIQUE NOT NULL,html_path TEXT,pdf_path TEXT,created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS slides(id INTEGER PRIMARY KEY AUTOINCREMENT,meeting_id INTEGER NOT NULL,slide_no INTEGER NOT NULL,title TEXT,text TEXT,notes TEXT);
+    CREATE TABLE IF NOT EXISTS materials(id INTEGER PRIMARY KEY AUTOINCREMENT,meeting_id INTEGER NOT NULL,kind TEXT NOT NULL,filename TEXT,detail TEXT,created_at TEXT NOT NULL);
     ''')
     # Migration-safe additions for meetings created before live-insights support existed.
     for table,col,decl in (('meetings','last_analyzed_ts','REAL DEFAULT 0'),('meetings','current_topic','TEXT'),('reports','docx_path','TEXT')):
@@ -378,13 +380,18 @@ def end_meeting(mid:int):
         # Keep the meeting ended and expose a useful error instead of an opaque 500.
         raise HTTPException(502,f'Report generation failed: {e}')
 
-QUESTION_SYSTEM=('You extract OPEN QUESTIONS from one segment of a meeting transcript. Include every unresolved item: '
- 'explicit questions that the segment does not answer; questions only partly answered; items explicitly deferred, tabled, '
- 'or "to be checked/confirmed later"; options or disagreements left undecided; unknown owners, deadlines, numbers or facts '
- 'the group said are still needed; blockers that need information. Do not include questions the segment fully answers. '
- 'Do not invent anything that is not in the segment. Return ONLY valid JSON: '
- '{"open_questions":[{"question":"","raised_by":"","timestamp":"","status":"Unanswered|Partially answered|Deferred","evidence":""}]}. '
- 'Evidence must quote or closely paraphrase the transcript line.')
+SCAN_SYSTEM=('You extract the important items from ONE segment of a meeting transcript. Be thorough: a missed item is worse than a borderline one, '
+ 'but never invent anything that is not in the segment. '
+ 'DECISION: any point the group agreed or settled, e.g. "agreed", "let us go with X", "yes, do that", "we will use X". Not mere suggestions. '
+ 'ACTION ITEM: any concrete task someone was asked to do or volunteered for, e.g. "can you check", "I will send", "we need to update X". '
+ 'owner = the named person or "Unknown"; deadline = the stated date or "Unknown". '
+ 'OPEN QUESTION: any question raised that the segment does not fully answer, any item deferred ("later", "let us check", "we need to confirm"), '
+ 'any undecided option, or missing information. '
+ 'Use empty lists when a category has nothing. Return ONLY valid JSON: '
+ '{"decisions":[{"decision":"","evidence":"","timestamp":""}],'
+ '"action_items":[{"owner":"","task":"","deadline":"","evidence":"","timestamp":""}],'
+ '"open_questions":[{"question":"","raised_by":"","timestamp":"","status":"Unanswered|Partially answered|Deferred","evidence":""}]}. '
+ 'evidence quotes or closely paraphrases the transcript line; timestamp is that line\'s [mm:ss].')
 
 def transcript_chunks(rows,limit=24000):
     """Yield the transcript in ~24k-char pieces, split on line boundaries."""
@@ -396,46 +403,33 @@ def transcript_chunks(rows,limit=24000):
         chunk.append(line); size+=len(line)+1
     if chunk: yield '\n'.join(chunk)
 
-def norm_q(s): return re.sub(r'\W+',' ',str(s or '').lower()).strip()
-
-def same_question(a,b):
-    """Duplicate check. Near-identical wording counts as the same question only when the
-    numbers in it match too, so 'item 5?' and 'item 10?' stay two separate questions."""
-    na,nb=norm_q(a),norm_q(b)
-    if not na or not nb: return False
-    if na==nb: return True
-    if re.findall(r'\d+',na)!=re.findall(r'\d+',nb): return False
-    return difflib.SequenceMatcher(None,na,nb).ratio()>=0.9
-
-def clean_question(q,default_status='Unanswered'):
-    if isinstance(q,str): q={'question':q}
-    if not isinstance(q,dict): return None
-    text=str(q.get('question') or '').strip()
-    if not text: return None
-    return {'question':text,'status':str(q.get('status') or default_status).strip() or default_status,
-            'raised_by':str(q.get('raised_by') or '').strip(),'timestamp':str(q.get('timestamp') or '').strip(),
-            'evidence':str(q.get('evidence') or '').strip()}
-
-def merge_questions(*groups):
-    out=[]
-    for g in groups:
-        for q in g:
-            if q and not any(same_question(q['question'],o['question']) for o in out): out.append(q)
-    return out
-
-def scan_open_questions(rows):
-    """Pass 1: question-focused extraction over the WHOLE transcript, chunk by chunk,
-    so a long meeting's early questions are not lost to the final report's window."""
-    found=[]
+def scan_items(rows):
+    """Full-transcript pass in chunks: returns (decisions, action_items, open_questions) candidates."""
+    dec=[]; act=[]; qs=[]; failed=0; chunks=0
     for chunk in transcript_chunks(rows):
-        try: res=groq_json(QUESTION_SYSTEM,'TRANSCRIPT SEGMENT:\n'+chunk)
+        chunks+=1
+        try: res=groq_json(SCAN_SYSTEM,'TRANSCRIPT SEGMENT:\n'+chunk)
         except Exception as e:
-            print(f'[SessionMind] question scan chunk failed: {e}'); continue
-        found+=[q for q in (clean_question(x) for x in (res.get('open_questions') or [])) if q]
-    return merge_questions(found)
+            failed+=1; print(f'[SessionMind] scan chunk failed: {e}'); continue
+        if not isinstance(res,dict): res={}
+        dec+=[x for x in (clean_decision(i) for i in (res.get('decisions') or [])) if x]
+        act+=[x for x in (clean_action(i) for i in (res.get('action_items') or [])) if x]
+        qs+=[x for x in (clean_question(i) for i in (res.get('open_questions') or [])) if x]
+    print(f'[SessionMind] scan: {chunks} chunk(s), {failed} failed; candidates dec={len(dec)} act={len(act)} q={len(qs)}')
+    return merge_items('decision',dec), merge_items('task',act), merge_items('question',qs)
+
+def budget_json(items,keys,limit):
+    """JSON array of whole items, cut at a size budget (never mid-item)."""
+    out=[]; used=0
+    for it in items:
+        s=json.dumps({k:it.get(k,'') for k in keys},ensure_ascii=False)
+        if used+len(s)>limit: break
+        out.append(s); used+=len(s)+2
+    return '['+', '.join(out)+']'
 
 def hydrate_report(raw):
-    rep=json.loads(raw); rep['mind_map_tree']=build_mind_map(rep); return rep
+    rep=json.loads(raw); tree=build_mind_map(rep)
+    rep['mind_map_tree']=tree; rep['mind_view']=mind_view(tree); return rep
 
 @app.get('/api/meetings/{mid}')
 def get_meeting(mid:int):
@@ -448,60 +442,185 @@ def get_meeting(mid:int):
         except Exception: report=None
     return {**dict(m),'transcript':[dict(x) for x in t],'screenshots':[dict(x) for x in s],'report_data':report}
 
+# ---------------------------------------------------------------- optional materials: recording + slides
+
+SEGMENT_SECONDS=480  # 8-minute audio pieces keep every Groq upload far below the file-size limit
+
+def ffprobe_duration(p):
+    try:
+        out=subprocess.run(['ffprobe','-v','error','-show_entries','format=duration','-of','default=nw=1:nk=1',str(p)],capture_output=True,text=True,timeout=120).stdout.strip()
+        return float(out)
+    except Exception: return 0.0
+
+def run_ff(args,timeout=3600):
+    p=subprocess.run(['ffmpeg','-hide_banner','-loglevel','error','-y',*args],capture_output=True,text=True,timeout=timeout)
+    if p.returncode: raise RuntimeError('FFmpeg failed: '+p.stderr[-600:])
+
+def process_recording(mid,src:Path,replace_live:bool,t0:float):
+    """Recording (video or audio) -> transcript lines (Groq Whisper, in 8-min pieces) + ~40 evenly spaced stills."""
+    if not shutil.which('ffmpeg'): raise RuntimeError('FFmpeg is not installed. Fedora: sudo dnf install ffmpeg')
+    work=MEDIA/f'rec_{mid}_{int(time.time()*1000)}'; work.mkdir(parents=True)
+    try:
+        duration=ffprobe_duration(src)
+        audio=work/'audio.wav'
+        run_ff(['-i',str(src),'-vn','-ac','1','-ar','16000','-c:a','pcm_s16le',str(audio)])
+        if not audio.exists() or audio.stat().st_size<1000: raise RuntimeError('The recording has no readable audio track.')
+        run_ff(['-i',str(audio),'-f','segment','-segment_time',str(SEGMENT_SECONDS),'-c','copy',str(work/'part_%03d.wav')])
+        new_rows=[]
+        for idx,part in enumerate(sorted(work.glob('part_*.wav'))):
+            res=groq_transcribe(part)
+            offset=idx*SEGMENT_SECONDS
+            segs=res.get('segments') or []
+            if segs:
+                for sg in segs:
+                    txt=(sg.get('text') or '').strip()
+                    if txt: new_rows.append((txt,t0+offset+parse_ts(sg.get('start'),0)))
+            elif (res.get('text') or '').strip():
+                new_rows.append((res['text'].strip(),t0+offset))
+        if not new_rows: raise RuntimeError('No speech was recognised in the recording.')
+        # Stills for visual evidence (video only; audio-only files just skip this).
+        frames=[]; interval=max(60.0,duration/40) if duration>0 else 60.0
+        try:
+            run_ff(['-i',str(src),'-vf',f'fps=1/{interval}','-frames:v','40','-q:v','4',str(work/'frame_%03d.jpg')],timeout=1800)
+            frames=sorted(work.glob('frame_*.jpg'))
+        except Exception as e: print(f'[SessionMind] no stills from recording: {e}')
+        stamp=int(time.time()*1000)
+        c=db()
+        for i,f in enumerate(frames):
+            dest=MEDIA/f'{mid}_rec_{stamp}_{i:03d}.jpg'; shutil.copy(f,dest)
+            c.execute('INSERT INTO screenshots(meeting_id,path,timestamp) VALUES(?,?,?)',(mid,str(dest.relative_to(BASE)),t0+i*interval))
+        if replace_live: c.execute("DELETE FROM transcript WHERE meeting_id=? AND source='groq_whisper'",(mid,))
+        for txt,ts in new_rows:
+            c.execute('INSERT INTO transcript(meeting_id,speaker,text,timestamp,source) VALUES(?,?,?,?,?)',(mid,'Recording',txt,ts,'recording'))
+        c.commit(); c.close()
+        return {'lines':len(new_rows),'minutes':round(duration/60,1),'stills':len(frames),'replaced_live':replace_live}
+    finally:
+        shutil.rmtree(work,ignore_errors=True)
+
+def process_slides(mid,src:Path):
+    """PowerPoint -> per-slide title, text, tables and speaker notes."""
+    from pptx import Presentation
+    try: prs=Presentation(str(src))
+    except Exception as e: raise RuntimeError(f'Could not read this PowerPoint file: {e}')
+    rows=[]
+    for i,slide in enumerate(prs.slides,1):
+        title=''
+        try:
+            if slide.shapes.title is not None and slide.shapes.title.has_text_frame: title=slide.shapes.title.text_frame.text.strip()
+        except Exception: pass
+        parts=[]
+        for shp in slide.shapes:
+            if getattr(shp,'has_text_frame',False) and shp.has_text_frame:
+                t='\n'.join(p.text for p in shp.text_frame.paragraphs if p.text.strip()).strip()
+                if t and t!=title: parts.append(t)
+            if getattr(shp,'has_table',False) and shp.has_table:
+                for row in shp.table.rows: parts.append(' | '.join(cell.text.strip() for cell in row.cells))
+        notes=''
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame is not None:
+            notes=slide.notes_slide.notes_text_frame.text.strip()
+        rows.append((i,title,'\n'.join(parts),notes))
+    c=db(); c.execute('DELETE FROM slides WHERE meeting_id=?',(mid,))
+    for r in rows: c.execute('INSERT INTO slides(meeting_id,slide_no,title,text,notes) VALUES(?,?,?,?,?)',(mid,*r))
+    c.commit(); c.close()
+    return len(rows)
+
+@app.post('/api/meetings/{mid}/materials')
+def upload_material(mid:int,kind:str=Form(...),file:UploadFile=File(...),replace_live:str=Form('true')):
+    if kind not in ('recording','slides'): raise HTTPException(400,'kind must be "recording" or "slides"')
+    c=db(); m=c.execute('SELECT id,started_at FROM meetings WHERE id=?',(mid,)).fetchone(); c.close()
+    if not m: raise HTTPException(404,'Meeting not found')
+    name=Path(file.filename or 'upload').name
+    suffix=Path(name).suffix.lower()
+    if kind=='slides' and suffix!='.pptx':
+        raise HTTPException(400,'Slides must be a .pptx file. In Google Slides or Keynote, export/download as PowerPoint first.')
+    dest=MEDIA/f'{mid}_{kind}_{int(time.time()*1000)}{suffix or ".bin"}'
+    with dest.open('wb') as f: shutil.copyfileobj(file.file,f)
+    try:
+        if kind=='recording':
+            t0=datetime.fromisoformat(m['started_at']).timestamp()
+            info=process_recording(mid,dest,str(replace_live).lower()!='false',t0)
+            detail=f"{info['minutes']} min · {info['lines']} transcript lines · {info['stills']} stills"
+        else:
+            detail=f"{process_slides(mid,dest)} slides"
+    except Exception as e:
+        raise HTTPException(422,f'{kind.title()} processing failed: {e}')
+    finally:
+        dest.unlink(missing_ok=True)
+    c=db(); c.execute('INSERT INTO materials(meeting_id,kind,filename,detail,created_at) VALUES(?,?,?,?,?)',(mid,kind,name,detail,now())); c.commit(); c.close()
+    return {'ok':True,'kind':kind,'filename':name,'detail':detail}
+
+# ---------------------------------------------------------------- report
+
 def build_report(mid):
-    c=db(); m=c.execute('SELECT * FROM meetings WHERE id=?',(mid,)).fetchone(); p=c.execute('SELECT * FROM projects WHERE id=?',(m['project_id'],)).fetchone(); t=c.execute('SELECT * FROM transcript WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); s=c.execute('SELECT * FROM screenshots WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); e=c.execute('SELECT * FROM events WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); c.close()
-    if not t: raise RuntimeError('No transcript was captured. Make sure the screen-share dialog has Share audio enabled and allow the meeting to run for at least 10 seconds.')
-    # Timestamps shown to the model and in the report are meeting-relative (mm:ss), not epoch seconds.
+    c=db(); m=c.execute('SELECT * FROM meetings WHERE id=?',(mid,)).fetchone(); p=c.execute('SELECT * FROM projects WHERE id=?',(m['project_id'],)).fetchone(); t=c.execute('SELECT * FROM transcript WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); s=c.execute('SELECT * FROM screenshots WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); e=c.execute('SELECT * FROM events WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); sl=c.execute('SELECT slide_no,title,text,notes FROM slides WHERE meeting_id=? ORDER BY slide_no',(mid,)).fetchall(); mats=c.execute('SELECT kind,filename,detail FROM materials WHERE meeting_id=? ORDER BY id',(mid,)).fetchall(); c.close()
+    if not t: raise RuntimeError('No transcript was captured. Make sure the screen-share dialog has Share audio enabled, or upload a recording, and allow the meeting to run for at least 10 seconds.')
+    # Timestamps are meeting-relative (mm:ss), not epoch seconds.
     try: t0=datetime.fromisoformat(m['started_at']).timestamp()
     except Exception: t0=t[0]['timestamp']
     rel=lambda ts: max(0.0,float(ts)-t0)
     rows=[{**dict(x),'timestamp':rel(x['timestamp'])} for x in t]
     shots=[{**dict(x),'timestamp':rel(x['timestamp'])} for x in s]
-    # Pass 1: question-focused scan over the complete transcript, plus questions detected live.
-    scanned=scan_open_questions(rows)
-    live=[clean_question({'question':x['content'],'evidence':x['evidence'] or '','timestamp':clock(rel(x['timestamp']))}) for x in e if x['type']=='question' and x['status']!='dismissed']
-    candidates=merge_questions(scanned,[q for q in live if q])
-    # Whole candidate entries only, within a size budget (anything left out is restored by the safety net below).
-    cand_items=[]; budget=20000
-    for q in candidates:
-        item=json.dumps({k:q[k] for k in ('question','status','raised_by','timestamp','evidence')},ensure_ascii=False)
-        if sum(len(x)+2 for x in cand_items)+len(item)>budget: break
-        cand_items.append(item)
-    cand_json='['+', '.join(cand_items)+']'
-    # Keep enough context for a detailed report while avoiding context-limit 400s on long meetings.
+    slides=[dict(x) for x in sl]
+
+    # Pass 1: full-transcript scan for decisions, action items and questions.
+    scan_dec,scan_act,scan_q=scan_items(rows)
+    # Live-detected items (from the Live insights panel) - dismissed ones are excluded.
+    def live(kind):
+        return [x for x in e if x['type']==kind and x['status']!='dismissed']
+    live_dec=[clean_decision({'decision':x['content'],'evidence':x['evidence'] or '','timestamp':clock(rel(x['timestamp']))}) for x in live('decision')]
+    live_act=[clean_action({'task':x['content'],'owner':x['assignee'],'deadline':x['deadline'],'evidence':x['evidence'] or '','timestamp':clock(rel(x['timestamp']))}) for x in live('task')]
+    live_q=[clean_question({'question':x['content'],'evidence':x['evidence'] or '','timestamp':clock(rel(x['timestamp']))}) for x in live('question')]
+    cand_dec=merge_items('decision',scan_dec,[x for x in live_dec if x])
+    cand_act=merge_items('task',scan_act,[x for x in live_act if x])
+    cand_q=merge_items('question',scan_q,[x for x in live_q if x])
+
     transcript='\n'.join(f'[{clock(x["timestamp"])}] {x["speaker"]}: {x["text"]}' for x in rows)[-80000:]
+    slide_text='\n'.join(f'Slide {x["slide_no"]} ({x["title"] or "untitled"}): {x["text"]}' for x in slides)[:15000]
+    cand_block=(f'CANDIDATE DECISIONS (JSON):\n{budget_json(cand_dec,("decision","evidence","timestamp"),7000)}\n\n'
+                f'CANDIDATE ACTION ITEMS (JSON):\n{budget_json(cand_act,("owner","task","deadline","evidence","timestamp"),7000)}\n\n'
+                f'CANDIDATE OPEN QUESTIONS (JSON):\n{budget_json(cand_q,("question","status","raised_by","timestamp","evidence"),7000)}')
     system=('You are SessionMind, an evidence-first meeting analyst. Analyze the complete meeting transcript. Do not invent facts. '
-            'Suggestions are not decisions; only treat a decision as confirmed when agreement/confirmation is explicit. '
-            'Every extracted item must be traceable to transcript timestamps. Use "Unknown" when ownership/deadline is not stated. '
-            'OPEN QUESTIONS: list every open question, unresolved issue, deferred item and unanswered point in the meeting, not just a few. '
-            'You are given CANDIDATE OPEN QUESTIONS from a full-transcript scan and live detection. Keep each candidate unless the transcript clearly resolves it '
-            '(then status "Answered" and the answer as evidence). You may reword for clarity and merge true duplicates, and you should add any other unresolved question you find. '
-            'Status must be one of: Unanswered, Partially answered, Deferred, Answered. '
-            'MIND MAP: "mind_map" is a tree for a mind-map view. root = the meeting title. branches = 4 to 8 main themes. '
-            'Each theme node has children such as its key points, decisions, action items (with owner), risks and open questions, '
-            'written as short labels of at most 12 words. Max 3 levels below the root. Only use what the transcript supports. '
+            'Every extracted item must be traceable to transcript timestamps. Use "Unknown" when owner or deadline is not stated. '
+            'DECISIONS: list points the group agreed or settled. Suggestions alone are not decisions. '
+            'ACTION ITEMS: list every concrete task someone was asked to do or volunteered for, even if the owner or deadline is Unknown. '
+            'OPEN QUESTIONS: list every unresolved question, deferred item, undecided option and missing information. '
+            'You are given CANDIDATES found by a full-transcript scan and by live detection. Keep each candidate unless the transcript clearly contradicts it, '
+            'you may reword for clarity and merge true duplicates, and you should add any further items you find. '
+            'If presentation slides are provided, use them as context and cite them as "Slide N" in evidence where relevant. '
+            'MIND MAP: "mind_map" describes the meeting. root = meeting title. branches = 3 to 8 main themes. Each theme has children: key points, decisions, '
+            'action items (with owner), risks and open questions, as short labels of at most 12 words. Use 2 levels only when the meeting has real structure; '
+            'if it is simple, themes can simply have no children. Only use what the transcript supports. '
             'Return ONLY valid JSON with this exact shape: '
-            '{"executive_summary":"","meeting_overview":"","key_discussion_points":[""],"decisions":[{"decision":"","evidence":""}],'
-            '"action_items":[{"owner":"","task":"","deadline":"","status":"Assigned","evidence":""}],'
+            '{"executive_summary":"","meeting_overview":"","key_discussion_points":[""],"decisions":[{"decision":"","evidence":"","timestamp":""}],'
+            '"action_items":[{"owner":"","task":"","deadline":"","status":"Assigned","evidence":"","timestamp":""}],'
             '"open_questions":[{"question":"","raised_by":"","timestamp":"","status":"Unanswered","evidence":""}],'
             '"risks":[{"risk":"","evidence":""}],"topics":[{"name":"","summary":"","evidence":""}],'
             '"mind_map":{"root":"","branches":[{"label":"","children":[{"label":"","children":[]}]}]},'
             '"important_moments":[{"timestamp":"","description":"","evidence":""}],"changes_from_previous_meeting":[""],"participants":[""]}. '
             'Keep it concise but comprehensive.')
     user=(f'Meeting: {m["title"]}\nTranscript:\n{transcript}\n\n'
-          f'CANDIDATE OPEN QUESTIONS (JSON):\n{cand_json}\n\n'
-          f'Previous project context:\n{previous_context(mid)}')
+          + (f'PRESENTATION SLIDES:\n{slide_text}\n\n' if slide_text else '')
+          + f'{cand_block}\n\nPrevious project context:\n{previous_context(mid)}')
     rep=groq_json(system,user)
-    # Safety net: never drop a candidate the model left out.
-    rep['open_questions']=merge_questions([q for q in (clean_question(x) for x in (rep.get('open_questions') or [])) if q], candidates)
-    for ev in rep.get('action_items',[]):
-        ev.setdefault('status','Assigned')
-    rep.update({'meeting_id':mid,'title':m['title'],'project':p['name'],'started_at':m['started_at'],'ended_at':m['ended_at'],'screenshot_count':len(s)})
+    if not isinstance(rep,dict): rep={}
+
+    # Safety net: every candidate survives, even if the model left it out.
+    rep['decisions']=merge_items('decision',[x for x in (clean_decision(i) for i in (rep.get('decisions') or [])) if x],cand_dec)
+    rep['action_items']=merge_items('task',[x for x in (clean_action(i) for i in (rep.get('action_items') or [])) if x],cand_act)
+    rep['open_questions']=merge_items('question',[x for x in (clean_question(i) for i in (rep.get('open_questions') or [])) if x],cand_q)
+    print(f'[SessionMind] report {mid}: decisions={len(rep["decisions"])} action_items={len(rep["action_items"])} open_questions={len(rep["open_questions"])}')
+
+    rep.update({'meeting_id':mid,'title':m['title'],'project':p['name'],'started_at':m['started_at'],'ended_at':m['ended_at'],'screenshot_count':len(s),'slides':slides})
+    sources=[f'Live capture: {len(t)} transcript lines']
+    for mt in mats: sources.append(f"{'Recording' if mt['kind']=='recording' else 'Slides'}: {mt['filename']} ({mt['detail']})")
+    if slides and not any(mt['kind']=='slides' for mt in mats): sources.append(f'Slides: {len(slides)} slides')
+    rep['sources']=sources
+
     tree=build_mind_map(rep)
     html_path=DATA/f'report_{mid}.html'; docx_path=DATA/f'report_{mid}.docx'
     render_html(rep,rows,shots,html_path,tree); render_docx(rep,rows,shots,docx_path,BASE,tree)
     c=db(); c.execute('UPDATE meetings SET report=? WHERE id=?',(json.dumps(rep,ensure_ascii=False),mid)); c.execute('INSERT INTO reports(meeting_id,html_path,docx_path,created_at) VALUES(?,?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET html_path=excluded.html_path,docx_path=excluded.docx_path,created_at=excluded.created_at',(mid,str(html_path.relative_to(BASE)),str(docx_path.relative_to(BASE)),now())); c.commit(); c.close()
-    return {**rep,'mind_map_tree':tree,'files':{'html':f'/api/reports/{mid}/html','docx':f'/api/reports/{mid}/docx'}}
+    return {**rep,'mind_map_tree':tree,'mind_view':mind_view(tree),'files':{'html':f'/api/reports/{mid}/html','docx':f'/api/reports/{mid}/docx'}}
 
 @app.get('/api/reports/{mid}/docx')
 def docx_report(mid:int):

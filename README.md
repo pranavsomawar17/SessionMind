@@ -69,7 +69,7 @@ Open:
 7. Conduct the meeting normally. The transcript now streams in roughly every 10 seconds instead of only appearing at the end.
 8. Watch the **Live insights** panel: every ~20 seconds it re-checks the new transcript for tasks, decisions, and open questions, and shows the current topic. Confirm or dismiss anything it detects.
 9. SessionMind also records periodic screenshots and (when a Groq vision model is available on your account) reads any live captions or slide text out of them, folding that into the transcript too.
-10. Click **End & Generate Report**.
+10. Optional: in **Optional materials**, choose a recording (video or audio) and/or a PowerPoint (`.pptx`) file. The recording is transcribed with Groq Whisper in 8-minute pieces and yields stills; the slides' text and speaker notes go into the report. Untick "Replace the live transcript" only if you want both transcripts kept side by side. Then click **End & Generate Report**.
 11. The complete transcript is sent to Groq LLM for structured meeting understanding.
 12. Download the Word (.docx) report, or open the HTML version.
 
@@ -83,9 +83,11 @@ The report can contain:
 - Key discussion points
 - Confirmed decisions with evidence
 - Action-item table with owner/deadline/status
-- Open questions (full-transcript scan plus live detection; every unresolved item is kept, with status and evidence)
+- Decisions, action items and open questions: found by a full-transcript scan plus the live insights, so items the final pass misses are still kept. Each has evidence and a timestamp.
 - Risks/blockers
-- Topic tree / mind map: root meeting → themes → key points, decisions, tasks, risks and open questions
+- Mind map: a tree when the meeting has real structure (root → themes → points, decisions, tasks, questions); a plain key-point list when it is simple
+- Presentation slides (from `.pptx`), when uploaded
+- Sources used (live capture, recording file, slides file)
 - Important moments
 - Changes from previous project meetings
 - Meeting screenshots
