@@ -4,5 +4,6 @@ __pycache__/
 *.pyc
 data/sessionmind.db
 data/media/*
+data/report_*.docx
 data/report_*.pdf
 data/report_*.html

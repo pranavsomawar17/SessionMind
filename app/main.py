@@ -4,8 +4,9 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from pathlib import Path
 from datetime import datetime, timezone
-import sqlite3, os, json, time, subprocess, shutil, re, html
+import sqlite3, os, json, time, subprocess, shutil, re, html, difflib
 import requests
+from .report_render import (build_mind_map, clock, render_docx, render_html, question_rows)
 
 BASE=Path(__file__).resolve().parents[1]
 try:
@@ -35,8 +36,8 @@ def db():
     CREATE TABLE IF NOT EXISTS reports(id INTEGER PRIMARY KEY AUTOINCREMENT,meeting_id INTEGER UNIQUE NOT NULL,html_path TEXT,pdf_path TEXT,created_at TEXT NOT NULL);
     ''')
     # Migration-safe additions for meetings created before live-insights support existed.
-    for col,decl in (('last_analyzed_ts','REAL DEFAULT 0'),('current_topic','TEXT')):
-        try: c.execute(f'ALTER TABLE meetings ADD COLUMN {col} {decl}')
+    for table,col,decl in (('meetings','last_analyzed_ts','REAL DEFAULT 0'),('meetings','current_topic','TEXT'),('reports','docx_path','TEXT')):
+        try: c.execute(f'ALTER TABLE {table} ADD COLUMN {col} {decl}')
         except sqlite3.OperationalError: pass
     return c
 
@@ -326,7 +327,9 @@ def analyze(mid:int):
     system=('You are the real-time extraction engine for SessionMind. Read the new transcript segment '
             'and extract structured events. Extract a "decision" only when there is clear agreement or '
             'confirmation, not a mere suggestion. Extract a "task" only when someone is clearly assigned '
-            'to or commits to an action. Extract a "question" only for genuine unanswered questions. '
+            'to or commits to an action. Extract a "question" for every question or open issue raised in the '
+            'segment that is not answered within that same segment, including questions the group defers, '
+            'items marked "we need to check/confirm", and unknown owners or deadlines that were flagged. '
             'Do not invent information not present in the transcript. Do not repeat already-detected '
             'events. Return ONLY valid JSON with this exact shape: '
             '{"topic":string|null,"events":[{"type":"task|decision|question","description":"","assignee":string|null,"deadline":string|null,"confidence":0.0}]}')
@@ -375,82 +378,136 @@ def end_meeting(mid:int):
         # Keep the meeting ended and expose a useful error instead of an opaque 500.
         raise HTTPException(502,f'Report generation failed: {e}')
 
-def build_report(mid):
-    c=db(); m=c.execute('SELECT * FROM meetings WHERE id=?',(mid,)).fetchone(); p=c.execute('SELECT * FROM projects WHERE id=?',(m['project_id'],)).fetchone(); t=c.execute('SELECT * FROM transcript WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); s=c.execute('SELECT * FROM screenshots WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); e=c.execute('SELECT * FROM events WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); c.close()
-    if not t: raise RuntimeError('No transcript was captured. Make sure the screen-share dialog has Share audio enabled and allow the meeting to run for at least 10 seconds.')
-    transcript='\n'.join(f'[{x["timestamp"]:.2f}] {x["speaker"]}: {x["text"]}' for x in t)
-    # Keep enough context for a detailed report while avoiding context-limit 400s on long meetings.
-    transcript=transcript[-80000:]
-    system='''You are SessionMind, an evidence-first meeting analyst. Analyze the complete meeting transcript. Do not invent facts. Suggestions are not decisions; only treat a decision as confirmed when agreement/confirmation is explicit. Every extracted item must be traceable to transcript timestamps. Return ONLY valid JSON with this exact shape: {"executive_summary":"","meeting_overview":"","key_discussion_points":[""],"decisions":[{"decision":"","evidence":""}],"action_items":[{"owner":"","task":"","deadline":"","status":"Assigned","evidence":""}],"open_questions":[{"question":"","status":"Unanswered","evidence":""}],"risks":[{"risk":"","evidence":""}],"topics":[{"name":"","summary":"","evidence":""}],"important_moments":[{"timestamp":"","description":"","evidence":""}],"changes_from_previous_meeting":[""],"participants":[""]}. Use "Unknown" when ownership/deadline is not stated. Keep it concise but comprehensive.'''
-    user=f'Meeting: {m["title"]}\nTranscript:\n{transcript}\n\nPrevious project context:\n{previous_context(mid)}'
-    rep=groq_json(system,user)
-    rep.update({'meeting_id':mid,'title':m['title'],'project':p['name'],'started_at':m['started_at'],'ended_at':m['ended_at'],'screenshot_count':len(s)})
-    for ev in rep.get('action_items',[]):
-        ev.setdefault('status','Assigned')
-    html_path=DATA/f'report_{mid}.html'; pdf_path=DATA/f'report_{mid}.pdf'
-    render_html(rep,t,s,html_path); render_pdf(rep,t,s,pdf_path)
-    c=db(); c.execute('UPDATE meetings SET report=? WHERE id=?',(json.dumps(rep,ensure_ascii=False),mid)); c.execute('INSERT INTO reports(meeting_id,html_path,pdf_path,created_at) VALUES(?,?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET html_path=excluded.html_path,pdf_path=excluded.pdf_path,created_at=excluded.created_at',(mid,str(html_path.relative_to(BASE)),str(pdf_path.relative_to(BASE)),now())); c.commit(); c.close()
-    return {**rep,'files':{'html':f'/api/reports/{mid}/html','pdf':f'/api/reports/{mid}/pdf'}}
+QUESTION_SYSTEM=('You extract OPEN QUESTIONS from one segment of a meeting transcript. Include every unresolved item: '
+ 'explicit questions that the segment does not answer; questions only partly answered; items explicitly deferred, tabled, '
+ 'or "to be checked/confirmed later"; options or disagreements left undecided; unknown owners, deadlines, numbers or facts '
+ 'the group said are still needed; blockers that need information. Do not include questions the segment fully answers. '
+ 'Do not invent anything that is not in the segment. Return ONLY valid JSON: '
+ '{"open_questions":[{"question":"","raised_by":"","timestamp":"","status":"Unanswered|Partially answered|Deferred","evidence":""}]}. '
+ 'Evidence must quote or closely paraphrase the transcript line.')
 
-def H(x):return html.escape(str(x or ''))
-def render_html(rep,t,s,path):
-    topics=rep.get('topics',[]); tasks=rep.get('action_items',[])
-    topic_nodes=''.join(f'<div class="node">{H(x.get("name"))}</div>' for x in topics)
-    shots=''.join(f'<figure><img src="/media/{H(Path(x["path"]).name)}"><figcaption>{x["timestamp"]:.0f}s</figcaption></figure>' for x in s)
-    task_rows=''.join(f'<tr><td>{H(x.get("owner"))}</td><td>{H(x.get("task"))}</td><td>{H(x.get("deadline"))}</td><td>{H(x.get("status"))}</td></tr>' for x in tasks) or '<tr><td colspan="4">No action items recorded.</td></tr>'
-    def bullets(a,key=None):return ''.join('<li>'+H(x if key is None else x.get(key,''))+'</li>' for x in a) or '<li>None recorded.</li>'
-    transcript=''.join(f'<p><b>{x["timestamp"]:.0f}s · {H(x["speaker"])}</b> — {H(x["text"])}</p>' for x in t)
-    body=f'''<!doctype html><html><head><meta charset="utf-8"><title>{H(rep["title"])} - SessionMind</title><style>body{{font:15px system-ui;max-width:1000px;margin:40px auto;color:#18202a;line-height:1.55}}h1{{margin-bottom:4px}}h2{{margin-top:30px;border-bottom:1px solid #ddd;padding-bottom:7px}}table{{width:100%;border-collapse:collapse}}th,td{{border:1px solid #ddd;padding:8px;text-align:left;vertical-align:top}}figure{{display:inline-block;width:46%;vertical-align:top}}img{{max-width:100%;border:1px solid #ddd}}.mind{{padding:20px;border:1px solid #ddd;border-radius:14px;display:flex;gap:10px;flex-wrap:wrap;align-items:center}}.center{{width:100%;font-weight:700}}.node{{border:1px solid #aaa;border-radius:20px;padding:8px 14px}}</style></head><body><h1>{H(rep["title"])}</h1><div>SessionMind AI Meeting Report · {H(rep["project"])}</div><h2>Executive Summary</h2><p>{H(rep.get("executive_summary"))}</p><h2>Meeting Overview</h2><p>{H(rep.get("meeting_overview"))}</p><h2>Participants</h2><ul>{bullets(rep.get("participants",[]))}</ul><h2>Key Discussion Points</h2><ul>{bullets(rep.get("key_discussion_points",[]))}</ul><h2>Decisions</h2><ul>{''.join(f'<li><b>{H(x.get("decision"))}</b> — {H(x.get("evidence"))}</li>' for x in rep.get("decisions",[])) or '<li>None recorded.</li>'}</ul><h2>Action Items</h2><table><tr><th>Owner</th><th>Task</th><th>Deadline</th><th>Status</th></tr>{task_rows}</table><h2>Open Questions</h2><ul>{''.join(f'<li>{H(x.get("question"))} — {H(x.get("status"))} [{H(x.get("evidence"))}]</li>' for x in rep.get("open_questions",[])) or '<li>None recorded.</li>'}</ul><h2>Risks / Blockers</h2><ul>{''.join(f'<li>{H(x.get("risk"))} — {H(x.get("evidence"))}</li>' for x in rep.get("risks",[])) or '<li>None recorded.</li>'}</ul><h2>Topics / Mind Map</h2><div class="mind"><div class="center">{H(rep["title"])}</div>{topic_nodes or '<div>No topics recorded.</div>'}</div><h2>Important Moments</h2><ul>{''.join(f'<li><b>{H(x.get("timestamp"))}</b> — {H(x.get("description"))} [{H(x.get("evidence"))}]</li>' for x in rep.get("important_moments",[])) or '<li>None recorded.</li>'}</ul><h2>Changes From Previous Meeting</h2><ul>{bullets(rep.get("changes_from_previous_meeting",[]))}</ul><h2>Meeting Screenshots</h2>{shots or '<p>No screenshots captured.</p>'}<h2>Evidence Transcript</h2>{transcript}</body></html>'''
-    path.write_text(body,encoding='utf-8')
+def transcript_chunks(rows,limit=24000):
+    """Yield the transcript in ~24k-char pieces, split on line boundaries."""
+    chunk=[]; size=0
+    for x in rows:
+        line=f'[{clock(x["timestamp"])}] {x["speaker"]}: {x["text"]}'
+        if chunk and size+len(line)>limit:
+            yield '\n'.join(chunk); chunk=[]; size=0
+        chunk.append(line); size+=len(line)+1
+    if chunk: yield '\n'.join(chunk)
 
-def render_pdf(rep,t,s,path):
-    from reportlab.lib.pagesizes import A4
-    from reportlab.lib import colors
-    from reportlab.lib.styles import getSampleStyleSheet,ParagraphStyle
-    from reportlab.lib.units import mm
-    from reportlab.platypus import SimpleDocTemplate,Paragraph,Spacer,Table,TableStyle,Image,PageBreak
-    st=getSampleStyleSheet(); st.add(ParagraphStyle(name='Tiny',parent=st['BodyText'],fontSize=8,textColor=colors.grey))
-    doc=SimpleDocTemplate(str(path),pagesize=A4,rightMargin=14*mm,leftMargin=14*mm,topMargin=14*mm,bottomMargin=14*mm)
-    story=[Paragraph('SessionMind — AI Meeting Report',st['Title']),Paragraph(H(rep['title']),st['Heading2']),Paragraph(f'Project: {H(rep["project"])}',st['Tiny']),Spacer(1,8),Paragraph('Executive Summary',st['Heading2']),Paragraph(H(rep.get('executive_summary','')),st['BodyText'])]
-    for title,items in [('Meeting Overview',[rep.get('meeting_overview','')]),('Key Discussion Points',rep.get('key_discussion_points',[]))]:
-        story += [Paragraph(title,st['Heading2'])]
-        for x in items: story += [Paragraph(H(x),st['BodyText']),Spacer(1,3)]
-    story += [Paragraph('Decisions',st['Heading2'])]
-    for x in rep.get('decisions',[]): story.append(Paragraph(f'<b>{H(x.get("decision"))}</b> — {H(x.get("evidence"))}',st['BodyText']))
-    story += [Paragraph('Action Items',st['Heading2'])]
-    data=[['Owner','Task','Deadline','Status']]+[[x.get('owner','Unknown'),x.get('task',''),x.get('deadline','Unknown'),x.get('status','Assigned')] for x in rep.get('action_items',[])]
-    if len(data)==1:data.append(['—','None recorded.','—','—'])
-    tab=Table(data,colWidths=[30*mm,78*mm,32*mm,30*mm],repeatRows=1); tab.setStyle(TableStyle([('GRID',(0,0),(-1,-1),.4,colors.grey),('BACKGROUND',(0,0),(-1,0),colors.whitesmoke),('VALIGN',(0,0),(-1,-1),'TOP'),('FONTSIZE',(0,0),(-1,-1),8)])); story += [tab]
-    for title,key in [('Open Questions','open_questions'),('Risks / Blockers','risks'),('Important Moments','important_moments'),('Changes From Previous Meeting','changes_from_previous_meeting')]:
-        story += [Paragraph(title,st['Heading2'])]
-        arr=rep.get(key,[])
-        for x in arr:
-            if isinstance(x,dict): text=' — '.join(str(x.get(k,'')) for k in ('question','risk','description','timestamp','evidence') if x.get(k))
-            else:text=str(x)
-            story.append(Paragraph(H(text),st['BodyText']))
-    story += [Paragraph('Topics / Mind Map',st['Heading2']),Paragraph(H(rep['title']),st['BodyText'])]
-    for x in rep.get('topics',[]): story.append(Paragraph('→ '+H(x.get('name','')),st['BodyText']))
-    if s:
-        story += [Paragraph('Meeting Screenshots',st['Heading2'])]
-        for x in s[:10]:
-            p=BASE/x['path']
-            if p.exists():
-                try:story += [Image(str(p),width=165*mm,height=92*mm),Paragraph(f'Evidence timestamp: {x["timestamp"]:.0f}s',st['Tiny']),Spacer(1,5)]
-                except:pass
-    story += [PageBreak(),Paragraph('Evidence Transcript',st['Heading2'])]
-    for x in t: story.append(Paragraph(f'<font color="grey">{x["timestamp"]:.0f}s · {H(x["speaker"])}</font> — {H(x["text"])}',st['BodyText']))
-    doc.build(story)
+def norm_q(s): return re.sub(r'\W+',' ',str(s or '').lower()).strip()
+
+def same_question(a,b):
+    """Duplicate check. Near-identical wording counts as the same question only when the
+    numbers in it match too, so 'item 5?' and 'item 10?' stay two separate questions."""
+    na,nb=norm_q(a),norm_q(b)
+    if not na or not nb: return False
+    if na==nb: return True
+    if re.findall(r'\d+',na)!=re.findall(r'\d+',nb): return False
+    return difflib.SequenceMatcher(None,na,nb).ratio()>=0.9
+
+def clean_question(q,default_status='Unanswered'):
+    if isinstance(q,str): q={'question':q}
+    if not isinstance(q,dict): return None
+    text=str(q.get('question') or '').strip()
+    if not text: return None
+    return {'question':text,'status':str(q.get('status') or default_status).strip() or default_status,
+            'raised_by':str(q.get('raised_by') or '').strip(),'timestamp':str(q.get('timestamp') or '').strip(),
+            'evidence':str(q.get('evidence') or '').strip()}
+
+def merge_questions(*groups):
+    out=[]
+    for g in groups:
+        for q in g:
+            if q and not any(same_question(q['question'],o['question']) for o in out): out.append(q)
+    return out
+
+def scan_open_questions(rows):
+    """Pass 1: question-focused extraction over the WHOLE transcript, chunk by chunk,
+    so a long meeting's early questions are not lost to the final report's window."""
+    found=[]
+    for chunk in transcript_chunks(rows):
+        try: res=groq_json(QUESTION_SYSTEM,'TRANSCRIPT SEGMENT:\n'+chunk)
+        except Exception as e:
+            print(f'[SessionMind] question scan chunk failed: {e}'); continue
+        found+=[q for q in (clean_question(x) for x in (res.get('open_questions') or [])) if q]
+    return merge_questions(found)
+
+def hydrate_report(raw):
+    rep=json.loads(raw); rep['mind_map_tree']=build_mind_map(rep); return rep
 
 @app.get('/api/meetings/{mid}')
 def get_meeting(mid:int):
     c=db(); m=c.execute('SELECT * FROM meetings WHERE id=?',(mid,)).fetchone()
     if not m:c.close();raise HTTPException(404,'Meeting not found')
-    t=c.execute('SELECT * FROM transcript WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); s=c.execute('SELECT * FROM screenshots WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); c.close(); return {**dict(m),'transcript':[dict(x) for x in t],'screenshots':[dict(x) for x in s]}
-@app.get('/api/reports/{mid}/pdf')
-def pdf(mid:int):
-    p=DATA/f'report_{mid}.pdf'
+    t=c.execute('SELECT * FROM transcript WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); s=c.execute('SELECT * FROM screenshots WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); c.close()
+    report=None
+    if m['report']:
+        try: report=hydrate_report(m['report'])
+        except Exception: report=None
+    return {**dict(m),'transcript':[dict(x) for x in t],'screenshots':[dict(x) for x in s],'report_data':report}
+
+def build_report(mid):
+    c=db(); m=c.execute('SELECT * FROM meetings WHERE id=?',(mid,)).fetchone(); p=c.execute('SELECT * FROM projects WHERE id=?',(m['project_id'],)).fetchone(); t=c.execute('SELECT * FROM transcript WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); s=c.execute('SELECT * FROM screenshots WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); e=c.execute('SELECT * FROM events WHERE meeting_id=? ORDER BY timestamp',(mid,)).fetchall(); c.close()
+    if not t: raise RuntimeError('No transcript was captured. Make sure the screen-share dialog has Share audio enabled and allow the meeting to run for at least 10 seconds.')
+    # Timestamps shown to the model and in the report are meeting-relative (mm:ss), not epoch seconds.
+    try: t0=datetime.fromisoformat(m['started_at']).timestamp()
+    except Exception: t0=t[0]['timestamp']
+    rel=lambda ts: max(0.0,float(ts)-t0)
+    rows=[{**dict(x),'timestamp':rel(x['timestamp'])} for x in t]
+    shots=[{**dict(x),'timestamp':rel(x['timestamp'])} for x in s]
+    # Pass 1: question-focused scan over the complete transcript, plus questions detected live.
+    scanned=scan_open_questions(rows)
+    live=[clean_question({'question':x['content'],'evidence':x['evidence'] or '','timestamp':clock(rel(x['timestamp']))}) for x in e if x['type']=='question' and x['status']!='dismissed']
+    candidates=merge_questions(scanned,[q for q in live if q])
+    # Whole candidate entries only, within a size budget (anything left out is restored by the safety net below).
+    cand_items=[]; budget=20000
+    for q in candidates:
+        item=json.dumps({k:q[k] for k in ('question','status','raised_by','timestamp','evidence')},ensure_ascii=False)
+        if sum(len(x)+2 for x in cand_items)+len(item)>budget: break
+        cand_items.append(item)
+    cand_json='['+', '.join(cand_items)+']'
+    # Keep enough context for a detailed report while avoiding context-limit 400s on long meetings.
+    transcript='\n'.join(f'[{clock(x["timestamp"])}] {x["speaker"]}: {x["text"]}' for x in rows)[-80000:]
+    system=('You are SessionMind, an evidence-first meeting analyst. Analyze the complete meeting transcript. Do not invent facts. '
+            'Suggestions are not decisions; only treat a decision as confirmed when agreement/confirmation is explicit. '
+            'Every extracted item must be traceable to transcript timestamps. Use "Unknown" when ownership/deadline is not stated. '
+            'OPEN QUESTIONS: list every open question, unresolved issue, deferred item and unanswered point in the meeting, not just a few. '
+            'You are given CANDIDATE OPEN QUESTIONS from a full-transcript scan and live detection. Keep each candidate unless the transcript clearly resolves it '
+            '(then status "Answered" and the answer as evidence). You may reword for clarity and merge true duplicates, and you should add any other unresolved question you find. '
+            'Status must be one of: Unanswered, Partially answered, Deferred, Answered. '
+            'MIND MAP: "mind_map" is a tree for a mind-map view. root = the meeting title. branches = 4 to 8 main themes. '
+            'Each theme node has children such as its key points, decisions, action items (with owner), risks and open questions, '
+            'written as short labels of at most 12 words. Max 3 levels below the root. Only use what the transcript supports. '
+            'Return ONLY valid JSON with this exact shape: '
+            '{"executive_summary":"","meeting_overview":"","key_discussion_points":[""],"decisions":[{"decision":"","evidence":""}],'
+            '"action_items":[{"owner":"","task":"","deadline":"","status":"Assigned","evidence":""}],'
+            '"open_questions":[{"question":"","raised_by":"","timestamp":"","status":"Unanswered","evidence":""}],'
+            '"risks":[{"risk":"","evidence":""}],"topics":[{"name":"","summary":"","evidence":""}],'
+            '"mind_map":{"root":"","branches":[{"label":"","children":[{"label":"","children":[]}]}]},'
+            '"important_moments":[{"timestamp":"","description":"","evidence":""}],"changes_from_previous_meeting":[""],"participants":[""]}. '
+            'Keep it concise but comprehensive.')
+    user=(f'Meeting: {m["title"]}\nTranscript:\n{transcript}\n\n'
+          f'CANDIDATE OPEN QUESTIONS (JSON):\n{cand_json}\n\n'
+          f'Previous project context:\n{previous_context(mid)}')
+    rep=groq_json(system,user)
+    # Safety net: never drop a candidate the model left out.
+    rep['open_questions']=merge_questions([q for q in (clean_question(x) for x in (rep.get('open_questions') or [])) if q], candidates)
+    for ev in rep.get('action_items',[]):
+        ev.setdefault('status','Assigned')
+    rep.update({'meeting_id':mid,'title':m['title'],'project':p['name'],'started_at':m['started_at'],'ended_at':m['ended_at'],'screenshot_count':len(s)})
+    tree=build_mind_map(rep)
+    html_path=DATA/f'report_{mid}.html'; docx_path=DATA/f'report_{mid}.docx'
+    render_html(rep,rows,shots,html_path,tree); render_docx(rep,rows,shots,docx_path,BASE,tree)
+    c=db(); c.execute('UPDATE meetings SET report=? WHERE id=?',(json.dumps(rep,ensure_ascii=False),mid)); c.execute('INSERT INTO reports(meeting_id,html_path,docx_path,created_at) VALUES(?,?,?,?) ON CONFLICT(meeting_id) DO UPDATE SET html_path=excluded.html_path,docx_path=excluded.docx_path,created_at=excluded.created_at',(mid,str(html_path.relative_to(BASE)),str(docx_path.relative_to(BASE)),now())); c.commit(); c.close()
+    return {**rep,'mind_map_tree':tree,'files':{'html':f'/api/reports/{mid}/html','docx':f'/api/reports/{mid}/docx'}}
+
+@app.get('/api/reports/{mid}/docx')
+def docx_report(mid:int):
+    p=DATA/f'report_{mid}.docx'
     if not p.exists():raise HTTPException(404,'Report not found')
-    return FileResponse(p,media_type='application/pdf',filename=f'sessionmind_{mid}.pdf')
+    return FileResponse(p,media_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document',filename=f'sessionmind_{mid}.docx')
 @app.get('/api/reports/{mid}/html')
 def report_html(mid:int):
     p=DATA/f'report_{mid}.html'

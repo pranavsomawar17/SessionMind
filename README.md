@@ -10,7 +10,7 @@ A lightweight, real meeting capture MVP focused on **AI understanding and the fi
 - **Groq vision:** best-effort reading of live captions/slide text out of periodic screenshots.
 - **Groq LLM:** runs incremental live task/decision/question extraction during the meeting, and analyzes the complete transcript + project history for the final report.
 - **SQLite:** stores meetings, transcripts, screenshots, live-detected events, and reports.
-- **ReportLab:** creates a PDF report.
+- **python-docx:** creates the final Word (.docx) report, including a topic tree and an open-questions table.
 - **HTML:** creates a lightweight browsable report.
 
 This does not pretend to have private Google Meet/Teams/Zoom internal feeds. The user explicitly grants browser capture permission and must enable audio sharing.
@@ -71,7 +71,7 @@ Open:
 9. SessionMind also records periodic screenshots and (when a Groq vision model is available on your account) reads any live captions or slide text out of them, folding that into the transcript too.
 10. Click **End & Generate Report**.
 11. The complete transcript is sent to Groq LLM for structured meeting understanding.
-12. Download/open the generated PDF or HTML report.
+12. Download the Word (.docx) report, or open the HTML version.
 
 ## Report contents
 
@@ -83,9 +83,9 @@ The report can contain:
 - Key discussion points
 - Confirmed decisions with evidence
 - Action-item table with owner/deadline/status
-- Open questions
+- Open questions (full-transcript scan plus live detection; every unresolved item is kept, with status and evidence)
 - Risks/blockers
-- Topics and a lightweight mind map
+- Topic tree / mind map: root meeting → themes → key points, decisions, tasks, risks and open questions
 - Important moments
 - Changes from previous project meetings
 - Meeting screenshots
@@ -143,3 +143,8 @@ The meeting must contain audible speech and the capture dialog must share system
 ### Live insights panel stays empty
 
 This calls the same Groq chat model as the final report, just more often and on a smaller window of text. If it's empty, check the browser console/network tab for `/api/meetings/{id}/analyze` errors — the most likely cause is the same as any other Groq call failing (bad key, rate limit).
+
+## Security
+
+Keep `.env` private. API keys are used only by the backend and are not sent to the browser UI.
+
