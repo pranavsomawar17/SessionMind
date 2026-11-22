@@ -1,6 +1,6 @@
 """Report layout: normalising model output, mind-map building, Word (.docx) and HTML rendering.
 
-Kept free of FastAPI/Groq imports so it can be tested on its own.
+Kept free of FastAPI and provider imports so it can be tested on its own.
 """
 import difflib
 import html
@@ -87,19 +87,43 @@ def clean_action(a):
     task = _first(a, 'task', 'action', 'description', 'text', 'item')
     if not task:
         return None
-    return {'owner': _first(a, 'owner', 'assignee', 'who') or 'Unknown', 'task': task,
-            'deadline': _first(a, 'deadline', 'due', 'due_date') or 'Unknown',
-            'status': _first(a, 'status') or 'Assigned', 'evidence': _first(a, 'evidence', 'quote'),
-            'timestamp': _first(a, 'timestamp', 'time')}
+    owner = _first(a, 'owner', 'assignee', 'who')
+    owner = 'Unknown' if is_unknown(owner) else owner
+    deadline = _first(a, 'deadline', 'due', 'due_date')
+    deadline = 'Unknown' if is_unknown(deadline) else deadline
+    return {'owner': owner, 'task': task, 'deadline': deadline,
+            'status': _first(a, 'status') or ('Needs owner' if owner == 'Unknown' else 'Assigned'),
+            'evidence': _first(a, 'evidence', 'quote'), 'timestamp': _first(a, 'timestamp', 'time')}
 
 
 def _norm(s):
     return re.sub(r'\W+', ' ', str(s or '').lower()).strip()
 
 
+_UNKNOWN = {'', 'unknown', 'none', 'n/a', 'na', 'null', 'unassigned', 'tbd', 'not stated', 'not specified',
+            'unspecified', 'nobody', 'someone', '-', '?'}
+_STOP = {'the', 'to', 'of', 'and', 'in', 'on', 'for', 'we', 'will', 'be', 'is', 'are', 'it', 'that', 'this',
+         'with', 'by', 'at', 'an', 'our', 'you', 'i', 'should', 'need', 'needs', 'needed', 'have', 'has',
+         'going', 'let', 'lets', 'us', 'can', 'could', 'would', 'please', 'so', 'then', 'do', 'does', 'what',
+         'about', 'whether', 'if', 'or', 'as', 'from', 'up'}
+
+
+def is_unknown(v):
+    return str(v or '').strip().lower() in _UNKNOWN
+
+
+def content_tokens(s):
+    """Meaningful words of a sentence (lower-case, no filler words)."""
+    return [t for t in re.findall(r'\w+', str(s or '').lower()) if t not in _STOP]
+
+
 def same_text(a, b):
-    """Duplicate check. Near-identical wording counts as the same item only when the
-    numbers in it match too, so 'item 5?' and 'item 10?' stay separate."""
+    """Duplicate check for two descriptions of the same item.
+
+    Exact match, or the same meaningful words (so a re-phrasing from an overlapping
+    transcript window still counts as one item). Numbers must agree, so 'item 5?' and
+    'item 10?' stay separate.
+    """
     na, nb = _norm(a), _norm(b)
     if not na or not nb:
         return False
@@ -107,17 +131,72 @@ def same_text(a, b):
         return True
     if re.findall(r'\d+', na) != re.findall(r'\d+', nb):
         return False
+    ta, tb = set(content_tokens(a)), set(content_tokens(b))
+    if ta and tb:
+        inter = len(ta & tb)
+        if inter / len(ta | tb) >= 0.6:
+            return True
+        if min(len(ta), len(tb)) >= 3 and inter / min(len(ta), len(tb)) >= 0.85:
+            return True
     return difflib.SequenceMatcher(None, na, nb).ratio() >= 0.9
 
 
-def merge_items(key, *groups):
-    """Concatenate item lists, dropping later duplicates of `key`."""
+def _owners_conflict(a, b):
+    """Two different, known people. 'Priya' and 'Priya S' are the same person."""
+    if is_unknown(a) or is_unknown(b):
+        return False
+    ta, tb = set(_norm(a).split()), set(_norm(b).split())
+    return not (ta <= tb or tb <= ta)
+
+
+def _enrich(kept, other):
+    """Fill gaps in the kept item with real values from its duplicate."""
+    for k, v in other.items():
+        if v in (None, '', []):
+            continue
+        cur = kept.get(k)
+        if cur in (None, '', []) or (k in ('owner', 'deadline', 'raised_by') and is_unknown(cur) and not is_unknown(v)):
+            kept[k] = v
+        if k == 'status' and kept.get('status') == 'Needs owner' and not is_unknown(kept.get('owner')):
+            kept['status'] = 'Assigned'
+
+
+def merge_items(key, *groups, owner_key=None):
+    """Concatenate item lists, folding later duplicates of `key` into the first copy.
+
+    With `owner_key`, two items only count as duplicates when they do not belong to
+    two different known people.
+    """
     out = []
     for g in groups:
         for it in g:
-            if it and not any(same_text(it[key], o[key]) for o in out):
-                out.append(it)
+            if not it:
+                continue
+            dup = next((o for o in out if same_text(it[key], o[key])
+                        and not (owner_key and _owners_conflict(it.get(owner_key), o.get(owner_key)))), None)
+            if dup is None:
+                out.append(dict(it))
+            else:
+                _enrich(dup, it)
     return out
+
+
+def seconds_of(stamp):
+    """'mm:ss' or 'h:mm:ss' -> seconds (a large number when missing, so undated items sort last)."""
+    try:
+        parts = [int(x) for x in str(stamp).strip().strip('[]').split(':')]
+    except ValueError:
+        return 10 ** 9
+    if not parts or len(parts) > 3:
+        return 10 ** 9
+    total = 0
+    for p in parts:
+        total = total * 60 + p
+    return total
+
+
+def by_time(items):
+    return sorted(items, key=lambda x: seconds_of(x.get('timestamp')))
 
 
 def question_rows(rep):
@@ -309,6 +388,8 @@ def render_docx(rep, transcript, screenshots, path, base_dir, tree=None):
          size=9, color=(0x55, 0x55, 0x55))
     for src in rep.get('sources') or []:
         para(f'Source: {src}', size=9, color=(0x55, 0x55, 0x55))
+    for w in rep.get('warnings') or []:
+        para(f'⚠ {w}', bold=True, size=9.5, color=(0xA0, 0x40, 0x10))
 
     doc.add_heading('Executive Summary', level=1)
     para(rep.get('executive_summary') or 'No summary generated.')
@@ -459,6 +540,7 @@ HTML_CSS = (
     '.tree span{display:inline-block;border:1px solid #aab6c8;border-radius:8px;padding:3px 10px;background:#f7f9fc}'
     '.tree>ul>li>span{font-weight:700;background:#e8eefc}'
     '.slide{border-left:3px solid #c9d2e0;padding-left:12px;margin:14px 0}'
+    '.warn{background:#fff4e5;border:1px solid #f0c27b;border-radius:6px;padding:8px 12px;font-weight:600}'
 )
 
 
@@ -498,10 +580,11 @@ def render_html(rep, transcript, screenshots, path, tree=None):
                       for x in rep.get('important_moments', []) if isinstance(x, dict)) or '<li>None recorded.</li>'
     sources = ''.join(f'<li>{H(s)}</li>' for s in rep.get('sources') or [])
     slides_section = ('<h2>Presentation Slides</h2>' + slides_html) if slides else ''
+    warn_html = ''.join(f'<p class="warn">⚠ {H(w)}</p>' for w in rep.get('warnings') or [])
 
     body = (f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">'
             f'<title>{H(rep.get("title"))} - SessionMind</title><style>{HTML_CSS}</style></head><body>'
-            f'<h1>{H(rep.get("title"))}</h1><div>SessionMind AI Meeting Report · {H(rep.get("project"))}</div><ul>{sources}</ul>'
+            f'<h1>{H(rep.get("title"))}</h1><div>SessionMind AI Meeting Report · {H(rep.get("project"))}</div><ul>{sources}</ul>{warn_html}'
             f'<h2>Executive Summary</h2><p>{H(rep.get("executive_summary"))}</p>'
             f'<h2>Meeting Overview</h2><p>{H(rep.get("meeting_overview"))}</p>'
             f'<h2>Participants</h2><ul>{bullets(rep.get("participants", []))}</ul>'

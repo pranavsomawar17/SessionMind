@@ -1,0 +1,8 @@
+# Local speech-to-text. Used when STT_PROVIDER=whisper (openai-whisper) or faster_whisper.
+# Needs FFmpeg on the system (SessionMind already requires it) and, for openai-whisper, PyTorch.
+# If installing fails on very new Python versions (3.13+), use Python 3.11 or 3.12 for the venv.
+openai-whisper>=20240930
+
+# Alternative with the same models: usually several times faster, much lighter to install.
+# Comment out openai-whisper above and use this instead with STT_PROVIDER=faster_whisper.
+# faster-whisper>=1.0.3

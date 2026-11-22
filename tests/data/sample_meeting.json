@@ -1,0 +1,56 @@
+{
+ "title": "Website relaunch weekly sync",
+ "note": "Synthetic meeting used by the tests and by scripts/eval_extraction.py. Speaker labels are generic on purpose, like real captures.",
+ "seconds_per_line": 12,
+ "speaker": "Meeting Speaker",
+ "lines": [
+  "Okay everyone, let's start. Today we need to cover the launch date, the hosting vendor and the content migration.",
+  "First, the launch date. Marketing wants to go live on the 15th of March. Is that realistic?",
+  "On the dev side we are about eighty percent done. The checkout flow still needs testing.",
+  "Rahul, can you finish the checkout testing by next Wednesday?",
+  "Yes, I'll do that. I'll also write up the test report.",
+  "Okay good. So are we agreeing on March 15th as the launch date?",
+  "Yes, let's lock in March 15th.",
+  "Agreed. Next topic, the hosting vendor. Priya, you looked at the options?",
+  "Yes. Acme is cheaper, but CloudNine has better uptime guarantees.",
+  "Priya, what happens with our data residency requirements if we pick Acme?",
+  "I don't know yet. I'll find out and email everyone by Friday.",
+  "Okay. Let's pick CloudNine unless the residency answer changes things.",
+  "Fine by me. What about budget approval? CloudNine is higher than the original estimate.",
+  "Meera, could you ask finance to approve the CloudNine quote?",
+  "Sure, I'll ask them on Monday.",
+  "Third topic, content migration. Who owns the blog content right now?",
+  "Not clear. Nobody has been assigned.",
+  "Let's park that and discuss it next week.",
+  "One more thing, the legal team still has to review the new privacy policy.",
+  "Also, do we need a cookie consent banner for customers in India?",
+  "Good question. Let's check with legal.",
+  "Dan, please update the project plan with the new dates.",
+  "Will do, by tomorrow.",
+  "Also we decided not to migrate the old forum. It will be archived.",
+  "Alright. Anything else? What time should we meet next week?",
+  "Same time Thursday. Thanks everyone."
+ ],
+ "expected": {
+  "decisions": [
+   "launch date March 15",
+   "pick CloudNine hosting unless residency changes",
+   "do not migrate the old forum archive it"
+  ],
+  "action_items": [
+   "Rahul finish checkout testing next Wednesday",
+   "Rahul write up the test report",
+   "Priya find out data residency Acme email everyone Friday",
+   "Meera ask finance approve CloudNine quote Monday",
+   "Dan update the project plan new dates tomorrow",
+   "legal team review the privacy policy",
+   "check with legal cookie consent banner India"
+  ],
+  "open_questions": [
+   "data residency requirements if we pick Acme",
+   "budget approval CloudNine higher than estimate",
+   "who owns the blog content migration",
+   "cookie consent banner customers in India"
+  ]
+ }
+}

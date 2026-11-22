@@ -1,152 +1,154 @@
-# SessionMind — AI Meeting Intelligence MVP
+# SessionMind
 
-A lightweight, real meeting capture MVP focused on **AI understanding and the final meeting report**, not manual transcript entry.
+AI meeting intelligence. It listens to a meeting (browser screen/tab capture with audio, or an uploaded
+recording), transcribes it, and produces a report with a summary, **decisions**, **action items**,
+**open questions**, risks and a mind map, as an in-app view, a Word file and an HTML file.
 
-## Architecture
+Speech-to-text and the AI analysis can run in the **cloud (Groq)** or **fully on your machine
+(Whisper + Ollama)**. You choose in `.env`; nothing else changes.
 
-- **Browser:** `getDisplayMedia()` captures a permitted meeting window/tab and system audio.
-- **FFmpeg:** converts the browser's WebM/Opus audio to 16 kHz mono WAV.
-- **Groq Whisper:** speech-to-text, uploaded in ~10s chunks while the meeting is live.
-- **Groq vision:** best-effort reading of live captions/slide text out of periodic screenshots.
-- **Groq LLM:** runs incremental live task/decision/question extraction during the meeting, and analyzes the complete transcript + project history for the final report.
-- **SQLite:** stores meetings, transcripts, screenshots, live-detected events, and reports.
-- **python-docx:** creates the final Word (.docx) report, including a topic tree and an open-questions table.
-- **HTML:** creates a lightweight browsable report.
-
-This does not pretend to have private Google Meet/Teams/Zoom internal feeds. The user explicitly grants browser capture permission and must enable audio sharing.
-
-## Requirements
-
-- Python 3.10+
-- Google Chrome or Chromium
-- FFmpeg
-- Groq API key
-
-### Fedora
+## Quick start
 
 ```bash
-sudo dnf install ffmpeg
+./run.sh            # creates the venv, installs, creates .env from .env.example, starts the app
 ```
 
-## Install
+Open http://127.0.0.1:8000. The status chip at the top tells you what is missing.
+
+You need Python 3.10+ and FFmpeg (`sudo dnf install ffmpeg` · `sudo apt install ffmpeg` · `brew install ffmpeg`).
+
+### Option A: cloud (easiest)
+
+In `.env` set `GROQ_API_KEY=...`. That's all; Groq is the default for all three engines.
+
+### Option B: fully local (nothing leaves your machine)
+
+1. Install [Ollama](https://ollama.com) and pull a model: `ollama pull qwen2.5:7b-instruct`
+2. Install local Whisper: `./run.sh --local` (or `pip install -r requirements-local.txt`)
+3. In `.env`:
+   ```
+   LLM_PROVIDER=ollama
+   STT_PROVIDER=whisper          # or faster_whisper
+   WHISPER_MODEL=small
+   WHISPER_LANGUAGE=en           # set your language; more accurate than auto-detect
+   ```
+4. Restart. The chip shows **Ready · fully local**.
+
+You can also mix: for example local Whisper with Groq analysis.
+
+## Choosing your AI engines
+
+| Setting | Values | Notes |
+|---|---|---|
+| `LLM_PROVIDER` | `groq`, `ollama` | Analysis: finds items, writes the report |
+| `STT_PROVIDER` | `groq`, `whisper`, `faster_whisper` | `whisper` = the official `openai-whisper` package. `faster_whisper` = same models, usually several times faster and a lighter install |
+| `VISION_PROVIDER` | `auto`, `groq`, `ollama`, `none` | Reads captions/slides from screenshots. `auto` follows `LLM_PROVIDER`, so a local setup never sends images to the cloud. With Ollama it stays off until you set `OLLAMA_VISION_MODEL` |
+
+Every setting is documented in `.env.example`.
+
+### Practical advice for local models
+
+These are rules of thumb, not benchmarks. Try them on your machine.
+
+* **Whisper must keep up with the meeting.** If a 20-second chunk takes longer than 20 seconds to transcribe,
+  the backlog grows. Use a smaller `WHISPER_MODEL` (`base`/`small` on CPU), `faster_whisper`, or a GPU.
+  Uploading a recording after the meeting avoids the real-time constraint.
+* **Bigger LLM, better extraction.** A 7-8B model is a reasonable start; 14B and above is noticeably better at
+  assigning owners and not inventing items. Measure it (see *Evaluating a model*) rather than guessing.
+* **Context size matters.** `OLLAMA_NUM_CTX` defaults to 16384 here because Ollama's own default is small and
+  silently truncates long prompts. Raise it if you have memory; the report then carries more of a long meeting.
+* **Whisper and the LLM share your GPU/RAM.** Running both at once is the usual cause of slowness.
+
+## How decisions, action items and open questions are found
+
+The earlier version missed items for specific, fixable reasons. The current pipeline (`app/services/extraction.py`):
+
+1. **Small overlapping windows.** The transcript is read in slices of a few thousand characters, each with
+   a few lines of context before it (so "Sure, I'll do it" is tied to the earlier request) and after it
+   (so a question answered right away is not reported as open).
+2. **Cue hints.** Lines that look like a question or a task are flagged for the model to check.
+3. **Grounding.** Every item must point at a real transcript line. Its timestamp and evidence quote are taken
+   from that line, and items that aren't in the transcript are discarded.
+4. **No silent loss.** If the model fails on a slice, a keyword fallback still records the obvious questions and
+   requests, marked *Unverified*, and the report shows a warning saying how many sections were affected.
+5. **Merging in code.** Items from all slices and from the live panel are merged and de-duplicated (rephrased
+   duplicates are recognised; different owners stay separate). The report model writes only the narrative, so a
+   long meeting can no longer produce a cut-off JSON reply that fails the whole report. If even the narrative
+   step fails, you still get a report with every extracted item.
+6. **Long meetings** send the model per-section summaries instead of chopping off the beginning.
+
+Items with no named owner get the status *Needs owner*; open questions are *Unanswered*, *Partially answered*,
+*Deferred* or *Unverified*.
+
+## Evaluating a model
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-cp .env.example .env
+python scripts/eval_extraction.py              # built-in labelled sample meeting
+python scripts/eval_extraction.py my.json -v   # your own labelled transcript
 ```
 
-Edit `.env`:
+It uses the engine configured in `.env` and prints recall per category and what was missed. Use it to compare
+models before you change your default. Format of the labelled file: see `tests/data/sample_meeting.json`.
 
-```env
-GROQ_API_KEY=gsk_your_key
-GROQ_TRANSCRIPTION_MODEL=whisper-large-v3-turbo
-GROQ_CHAT_MODEL=llama-3.3-70b-versatile
-```
-
-No OpenAI key is required or used by this MVP.
-
-## Run
+## Tests
 
 ```bash
-source venv/bin/activate
-python -m uvicorn app.main:app --reload
+pip install -r requirements-dev.txt
+pytest
 ```
 
-Open:
+The tests use scripted stand-ins for the AI engines (and a local fake Ollama server), so they check the pipeline,
+not model quality. They run without any API key, model or GPU.
 
-`http://127.0.0.1:8000`
+## Project layout
 
-## How to use
+```
+app/
+  main.py                 app wiring and /api/status
+  config.py  db.py        settings; SQLite (schema created once, migrations applied once)
+  providers/              the only place that talks to AI engines
+    base.py               interfaces, JSON parsing, Whisper hallucination filter
+    groq.py               cloud LLM + speech-to-text + vision
+    ollama.py             local LLM + vision
+    stt_local.py          openai-whisper and faster-whisper
+  services/
+    extraction.py         windows, prompts, grounding, fallback (no DB code)
+    live.py               live insights while the meeting runs
+    report.py             final report
+    transcripts.py screenshots.py materials.py audio.py
+  routes/                 HTTP endpoints (URLs unchanged)
+  report_render.py        Word / HTML rendering, de-duplication
+static/                   the web UI
+scripts/eval_extraction.py
+tests/
+```
 
-1. Select/create a project.
-2. Enter a meeting title, and optionally a **speaker label** — who's about to talk (you can change this mid-meeting before each turn; there's no automatic diarization, so this is how speakers get named in the transcript).
-3. Click **Start AI Meeting**.
-4. Click **Share Meeting Screen + Audio**.
-5. In the browser chooser, select the meeting tab/window.
-6. Enable **Share audio**.
-7. Conduct the meeting normally. The transcript now streams in roughly every 10 seconds instead of only appearing at the end.
-8. Watch the **Live insights** panel: every ~20 seconds it re-checks the new transcript for tasks, decisions, and open questions, and shows the current topic. Confirm or dismiss anything it detects.
-9. SessionMind also records periodic screenshots and (when a Groq vision model is available on your account) reads any live captions or slide text out of them, folding that into the transcript too.
-10. Optional: in **Optional materials**, choose a recording (video or audio) and/or a PowerPoint (`.pptx`) file. The recording is transcribed with Groq Whisper in 8-minute pieces and yields stills; the slides' text and speaker notes go into the report. Untick "Replace the live transcript" only if you want both transcripts kept side by side. Then click **End & Generate Report**.
-11. The complete transcript is sent to Groq LLM for structured meeting understanding.
-12. Download the Word (.docx) report, or open the HTML version.
-
-## Report contents
-
-The report can contain:
-
-- Executive summary
-- Meeting overview
-- Participants (only when supported by transcript)
-- Key discussion points
-- Confirmed decisions with evidence
-- Action-item table with owner/deadline/status
-- Decisions, action items and open questions: found by a full-transcript scan plus the live insights, so items the final pass misses are still kept. Each has evidence and a timestamp.
-- Risks/blockers
-- Mind map: a tree when the meeting has real structure (root → themes → points, decisions, tasks, questions); a plain key-point list when it is simple
-- Presentation slides (from `.pptx`), when uploaded
-- Sources used (live capture, recording file, slides file)
-- Important moments
-- Changes from previous project meetings
-- Meeting screenshots
-- Evidence transcript
-
-The AI is instructed not to invent decisions, owners, deadlines or progress.
-
-## What changed in this version
-
-- **Fixed a bug where the transcript never appeared until the meeting ended.** `MediaRecorder.start()` was called with no timeslice, so audio only ever flushed once, at `stop()` — for a long meeting this also risked hitting Groq Whisper's file-size limit in one giant upload. Live audio is now captured as a sequence of independently valid WebM files, one every 10 seconds (see next point for why that's not just `start(10000)`), so the "Live session" panel actually updates live and each upload stays small.
-- **Correction to that fix:** the first pass used `MediaRecorder.start(10000)` (a timeslice), which produces a stream of chunks that are *not* independently decodable — only the very first chunk has a WebM/EBML header; every chunk after that is a headerless continuation fragment, so ffmpeg correctly rejects it with `EBML header parsing failed`. The fix instead **stops and restarts** the recorder every 10 seconds on the same audio stream. Each `stop()` flushes one complete, self-contained WebM file, so every uploaded chunk decodes cleanly. The trade-off is a sub-second gap in the recording at each rotation point — negligible for meeting transcription, but worth knowing about.
-- **Live task/decision/question detection.** The `events` table existed in the schema but nothing ever wrote to it. There's now a `/api/meetings/{id}/analyze` endpoint, polled every 20s while capturing, that reads new transcript since the last check and extracts tasks/decisions/questions/topic — shown in a new **Live insights** panel with confirm/dismiss controls, per the original spec's "Live Dashboard" requirement.
-- **Screenshots are now actually analyzed.** They were captured and stored but never read. A best-effort Groq vision call now reads live captions or slide/document text out of each one and folds it into the transcript — this is what makes the report meaningfully reflect what was *shown*, not just said. If your account has no vision-capable model available, this silently no-ops rather than breaking capture.
-- **Manual speaker labeling**, since there's no real diarization — a "Speaker label" field tags who's talking, sent with each audio chunk.
-- **Fixed an event-loop-blocking bug**: the audio and screenshot endpoints were `async def` but called blocking code (`ffmpeg`, `requests`) directly inside them, which stalls every other in-flight request for the duration of each transcription call. They're plain `def` now, so FastAPI runs them in a worker thread instead.
-- **Added `PRAGMA busy_timeout`** so the now much more frequent SQLite writes (chunked audio + screenshots + live events, all roughly every 10–20s) don't intermittently fail with "database is locked" under load.
-- Fixed a duplicated line in the requirements note in this README.
-
-## Important capture note
-
-On Linux, browser screen/audio sharing support varies by browser and capture source. If **Share audio** is unavailable for a particular window, try sharing the **meeting browser tab** instead. The meeting tab must expose its audio to the browser's screen-capture API.
+To add another engine (for example LM Studio or whisper.cpp), implement `LLMProvider` / `STTProvider` from
+`providers/base.py` and register it in `providers/__init__.py`.
 
 ## Troubleshooting
 
-### `GROQ_API_KEY` missing
+* **"Cannot reach Ollama"**: start it with `ollama serve` (or open the Ollama app) and check `OLLAMA_URL`.
+* **"model is not installed"**: run the `ollama pull ...` command shown in the message.
+* **`pip install openai-whisper` fails**: it needs PyTorch; try Python 3.11/3.12 for the venv, or use `faster_whisper`.
+* **Transcript is empty or full of "thanks for watching"**: no audio reached the app (enable *Share audio* in the
+  browser's share dialog). Whisper invents text on silence; known phrases are filtered, and `faster_whisper`
+  also skips silence.
+* **Wrong language / garbled names**: set `WHISPER_LANGUAGE` and put names in `WHISPER_PROMPT`.
+* **Report shows a ⚠ warning**: the analysis model failed on some sections (rate limit, timeout, model down).
+  The message says why. Fix the cause, then rebuild the report with `curl -X POST http://127.0.0.1:8000/api/meetings/<id>/end` (list meeting ids with `curl http://127.0.0.1:8000/api/projects/<project id>/meetings`; the first project is id 1. The transcript is kept, so nothing is lost).
+* **Groq rate limits**: requests are retried with backoff and rotate through multiple comma-separated keys.
 
-Run:
+## Known limitations
 
-```bash
-cat .env
-```
-
-Make sure the key is in `GROQ_API_KEY`, not `OPENAI_API_KEY`.
-
-### FFmpeg error
-
-```bash
-ffmpeg -version
-```
-
-If unavailable on Fedora:
-
-```bash
-sudo dnf install ffmpeg
-```
-
-### No audio captured
-
-Restart capture and choose the meeting tab/window. Enable **Share audio**. A screenshot can work without audio; transcription cannot.
-
-### No transcript
-
-The meeting must contain audible speech and the capture dialog must share system audio. Very tiny recordings are ignored.
-
-### Live insights panel stays empty
-
-This calls the same Groq chat model as the final report, just more often and on a smaller window of text. If it's empty, check the browser console/network tab for `/api/meetings/{id}/analyze` errors — the most likely cause is the same as any other Groq call failing (bad key, rate limit).
+* An open question is judged within its slice plus a few lines after it. A question raised early and answered much
+  later in the meeting can still be listed as open.
+* All audio is one stream, so owners come from names spoken in the conversation, not voice identification.
+* Chunked live capture can clip a word at a chunk boundary.
+* Local Whisper and Ollama paths are covered by tests with stand-ins; real-model quality depends on the model and
+  hardware you choose, which is what `scripts/eval_extraction.py` is for.
 
 ## Security
 
-Keep `.env` private. API keys are used only by the backend and are not sent to the browser UI.
-
+Keep `.env` private: it holds your API key and is excluded by `.gitignore`. Don't zip or share the project folder
+with `.env` inside. If a key was ever shared, rotate it in the Groq console.

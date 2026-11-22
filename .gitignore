@@ -1,9 +1,13 @@
 .env
 venv/
+.venv/
 __pycache__/
 *.pyc
-data/sessionmind.db
+.pytest_cache/
+data/sessionmind.db*
 data/media/*
+!data/media/.gitkeep
 data/report_*.docx
 data/report_*.pdf
 data/report_*.html
+*.zip
